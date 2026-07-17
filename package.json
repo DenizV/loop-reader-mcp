@@ -1,0 +1,22 @@
+{
+  "name": "loop-reader-mcp",
+  "version": "1.0.0",
+  "description": "Read-only remote MCP server that lets an AI assistant search and read Microsoft Loop content via the Graph API, with per-user permission trimming.",
+  "type": "module",
+  "main": "src/httpServer.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node src/httpServer.js"
+  },
+  "keywords": ["mcp", "model-context-protocol", "microsoft-loop", "microsoft-graph", "oauth", "on-behalf-of"],
+  "dependencies": {
+    "@azure/msal-node": "^2.16.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "dotenv": "^16.4.0",
+    "jose": "^5.9.0",
+    "zod": "^3.23.0"
+  },
+  "optionalDependencies": {
+    "applicationinsights": "^3.5.0"
+  }
+}
