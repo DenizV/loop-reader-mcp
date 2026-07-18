@@ -1,23 +1,14 @@
-# dependencies
 node_modules/
-
-# secrets & local config — NEVER commit
 .env
 .env.*
 *.pem
 *.pfx
 *.key
 .token-cache.json
-
-# build/deploy artifacts
 deploy.zip
 *.zip
-
-# logs
 *.log
 npm-debug.log*
-
-# OS / editor
 .DS_Store
 Thumbs.db
 .vscode/

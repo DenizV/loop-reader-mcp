@@ -70,17 +70,18 @@ async function request(method, path, { params, body, accept, as = "user" } = {})
     }
 
     const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > MAX_BYTES) {
-      return {
-        truncated: true,
-        text: buf.subarray(0, MAX_BYTES).toString("utf8"),
-      };
-    }
-    const text = buf.toString("utf8");
     const ct = res.headers.get("content-type") || "";
-    return ct.includes("application/json")
-      ? JSON.parse(text)
-      : { truncated: false, text };
+    // JSON responses (search results, item metadata) are always parsed in full
+    // — never truncated — so a large API response can't silently become
+    // "undefined" and yield zero results. The size cap applies only to page
+    // CONTENT (html/raw), which is what could realistically be huge.
+    if (ct.includes("application/json")) {
+      return JSON.parse(buf.toString("utf8"));
+    }
+    if (buf.length > MAX_BYTES) {
+      return { truncated: true, text: buf.subarray(0, MAX_BYTES).toString("utf8") };
+    }
+    return { truncated: false, text: buf.toString("utf8") };
   } finally {
     clearTimeout(timer);
   }

@@ -22,13 +22,43 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { runWithUser } from "./userContext.js";
 import { registerTools } from "./tools.js";
+import { audit } from "./audit.js";
+import { getAppToken } from "./auth.js";
 
 // ── Application Insights (best-effort; never blocks startup) ───────────────
+// Lean config: keep request + dependency + exception tracking (dependency
+// timing shows exactly how long each Graph call takes — useful for the read-
+// latency question) but drop the heavier collectors so it costs less per
+// request on a small plan. Console auto-collection is off because our audit
+// lines already go to stdout → Log Analytics.
 if (process.env.APPLICATIONINSIGHTS_CONNECTION_STRING) {
   try {
     const appInsights = (await import("applicationinsights")).default;
-    appInsights.setup().start();
-    process.stderr.write("Application Insights SDK initialized\n");
+    appInsights
+      .setup()
+      .setAutoCollectConsole(false)
+      .setAutoCollectPerformance(false, false)
+      .setSendLiveMetrics(false)
+      .start();
+    // Redact Loop drive/item identifiers from dependency + request telemetry so
+    // they don't leave the controlled audit sink. Keeps timing/latency data.
+    const redact = (s) =>
+      typeof s === "string"
+        ? s
+            .replace(/\/drives\/[^/]+/gi, "/drives/{driveId}")
+            .replace(/\/items\/[^/?]+/gi, "/items/{itemId}")
+        : s;
+    appInsights.defaultClient?.addTelemetryProcessor((envelope) => {
+      const d = envelope?.data?.baseData;
+      if (d) {
+        if (d.name) d.name = redact(d.name);
+        if (d.data) d.data = redact(d.data);
+        if (d.target) d.target = redact(d.target);
+        if (d.url) d.url = redact(d.url);
+      }
+      return true;
+    });
+    process.stderr.write("Application Insights SDK initialized (lean config, IDs redacted)\n");
   } catch (err) {
     process.stderr.write(`Application Insights init failed (continuing): ${err.message}\n`);
   }
@@ -50,12 +80,29 @@ const ISSUERS = [
   `https://sts.windows.net/${TENANT}/`,
 ];
 
+// Optional explicit scope enforcement (defense-in-depth). The OBO exchange
+// would fail for a wrong-audience token anyway, but checking scp here rejects
+// it earlier and makes intent explicit. Set REQUIRE_SCOPE=false to disable.
+const REQUIRE_SCOPE = process.env.REQUIRE_SCOPE !== "false";
+const REQUIRED_SCOPE = "access_as_user";
+
 async function validateBearer(token) {
   const { payload } = await jwtVerify(token, JWKS, {
     audience: AUDIENCES,
     issuer: ISSUERS,
+    clockTolerance: 60, // seconds — tolerate small clock skew, avoid premature 401s
   });
-  return payload; // throws if invalid/expired
+  // Always require a delegated access token: ID tokens carry aud=client_id but
+  // no `scp` claim. Rejecting tokens without `scp` blocks ID-token replay
+  // regardless of REQUIRE_SCOPE (defense against the bare client_id audience).
+  const scopes = String(payload.scp || "").split(" ").filter(Boolean);
+  if (scopes.length === 0) {
+    throw new Error("not a delegated access token (no scp claim)");
+  }
+  if (REQUIRE_SCOPE && !scopes.includes(REQUIRED_SCOPE)) {
+    throw new Error(`token missing required scope ${REQUIRED_SCOPE}`);
+  }
+  return payload; // throws if invalid/expired/insufficient scope
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -96,7 +143,10 @@ createServer(async (req, res) => {
       resource: PUBLIC_URL,
       authorization_servers: [PUBLIC_URL],
       bearer_methods_supported: ["header"],
-      scopes_supported: [`api://${CLIENT_ID}/access_as_user`],
+      // Advertise offline_access so the client requests a refresh token and can
+      // silently renew — avoids the "reconnect every few hours" prompt when the
+      // short-lived access token expires.
+      scopes_supported: [`api://${CLIENT_ID}/access_as_user`, "offline_access"],
     });
     return;
   }
@@ -136,17 +186,19 @@ createServer(async (req, res) => {
     return;
   }
 
+  let claims;
   try {
-    await validateBearer(bearer);
+    claims = await validateBearer(bearer);
   } catch (err) {
     process.stderr.write(`Token validation failed: ${err.message}\n`);
+    audit("auth.deny", { reason: err.message });
     challenge(res);
     return;
   }
 
-  // Valid token → pin to request context and dispatch to MCP.
-  await runWithUser(bearer, async () => {
-    const server = new McpServer({ name: "loop-reader-mcp", version: "1.0.0" });
+  // Valid token → pin token + claims to request context and dispatch to MCP.
+  await runWithUser(bearer, claims, async () => {
+    const server = new McpServer({ name: "loop-reader-mcp", version: "1.1.0" });
     registerTools(server);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => transport.close());
@@ -154,5 +206,8 @@ createServer(async (req, res) => {
     await transport.handleRequest(req, res);
   });
 }).listen(PORT, () => {
-  process.stderr.write(`loop-reader-mcp (v1.0, HTTP) listening on :${PORT}\n`);
+  process.stderr.write(`loop-reader-mcp (v1.1, HTTP) listening on :${PORT}\n`);
+  // Pre-warm the app-only (retrieval) token so the first page read doesn't pay
+  // the client-credentials round-trip. Best-effort; ignore failures at boot.
+  getAppToken().catch(() => {});
 });
